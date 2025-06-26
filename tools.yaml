@@ -1,0 +1,67 @@
+sources:
+  my-pg-source:
+    kind: postgres
+    host: ep-ancient-shape-a1kjibq3-pooler.ap-southeast-1.aws.neon.tech
+    port: 5432        # Neon uses the standard port unless noted otherwise
+    database: neondb
+    user: neondb_owner
+    password: npg_OqZYgaH46CQb
+metadata_source:
+  kind: postgres
+  host: ep-ancient-shape-a1kjibq3-pooler.ap-southeast-1.aws.neon.tech
+  port: 5432        # Neon uses the standard port unless noted otherwise
+  database: neondb
+  user: neondb_owner
+  password: npg_OqZYgaH46CQb
+tools:
+  users-in-workspace:
+    kind: postgres-sql
+    source: my-pg-source
+    description: Get all users in a workspace.
+    parameters:
+      - name: workspace_id
+        type: string
+        description: The id of the workspace.
+    statement: |
+      SELECT *
+      FROM public.user
+      JOIN public.user_workspace_link
+        ON public.user.id = public.user_workspace_link.user_id
+      WHERE workspace_id = $1;
+    pre_hook: pre-test:func1
+    datasource_ids: "64e65350-30ae-4f50-a133-a52f049213cb,657c66ce-6589-419a-9bcf-cd099deeb6eb"
+
+  domains-in-workspace:
+    kind: postgres-sql
+    source: my-pg-source
+    description: Get all domains in a workspace.
+    parameters:
+      - name: workspace_id
+        type: string
+        description: The id of the workspace.
+    statement: |
+      SELECT name, description
+      FROM public.domain
+      WHERE workspace_id = $1;
+
+  workspace-favourited-by-user:
+    kind: postgres-sql
+    source: my-pg-source
+    description: Get all workspaces favourited by a user.
+    parameters:
+      - name: user_id
+        type: string
+        description: The id of the user.
+    statement: |
+      SELECT *
+      FROM public.workspace
+      JOIN public.user_workspace_favorited
+        ON public.workspace.id = public.user_workspace_favorited.workspace_id
+      WHERE user_id = $1;
+
+toolsets:
+  user-workspace-server:
+    - users-in-workspace
+    - workspace-favourited-by-user
+  workspace-domain-server:
+    - domains-in-workspace
