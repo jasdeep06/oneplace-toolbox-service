@@ -1,40 +1,30 @@
 # deploy_api.py
 import shutil, tempfile, uuid, os, zipfile
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Optional
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from docker import from_env as docker_from_env
 import docker.errors
 
 from dataclasses import dataclass
 from docker.models.containers import Container
+from utils import add_and_reload_nginx, remove_server_block
+
+from db import get_toolset_by_server_id, make_yaml, get_server_url_and_port
+
 
 
 
 app = FastAPI()
-DOCKER_IMAGE = "9e9869f196"        # your pre-built image
-HOST_PORT_POOL = range(8100, 9000)     # pick whatever range you like
-_port_iter = iter(HOST_PORT_POOL)      # naive allocator – replace with DB if multi-node
+DOCKER_IMAGE = "0d7c52e29a52"        # your pre-built image
+
 
 
 # ----------------------------------------------------------------------
-@dataclass
-class Deployment:
-    container_id: str
-    host_port:    int
-    workdir:      Path                # holds plugins/ and tools.yaml
-    volumes:      dict                # docker-py volume dict we used
-    image:        str = DOCKER_IMAGE  # default
-
-DEPLOYMENTS: dict[str, Deployment] = {}
 
 
 
-def next_port() -> int:
-    try:
-        return next(_port_iter)
-    except StopIteration:
-        raise RuntimeError("Port pool exhausted")
+
 
 def extract_hooks(upload: UploadFile, dest: Path):
     """
@@ -52,67 +42,96 @@ def extract_hooks(upload: UploadFile, dest: Path):
     with open(dest_file, "wb") as out_fp:        
         shutil.copyfileobj(upload.file, out_fp) 
 
-@app.post("/deploy")
+
+
+
+
+
+#accept server_id and generate tools.yaml, make blob optional
+@app.post("/deploy/{server_id}")
 async def deploy(
-    tools_yaml: Annotated[UploadFile, File(description="YAML file")],
-    hooks_blob: Annotated[UploadFile, File(description="hooks code (py)")],
+    server_id: str,
+    hooks_blob: Annotated[
+        UploadFile | None,                    # ↱ UploadFile is optional
+        File(description="Optional hooks code (.py)")
+    ] = None,
+    #optional
 ):
     workdir = Path(tempfile.mkdtemp(prefix="toolbox_"))
     plugins_dir = workdir / "plugins"
     plugins_dir.mkdir()
     yaml_path  = workdir / "tools.yaml"
 
-    # 1. save YAML
-    with open(yaml_path, "wb") as f:
-        shutil.copyfileobj(tools_yaml.file, f)
+    volumes = {
+        str(workdir / "plugins"): {"bind": "/plugins", "mode": "ro"},
+        str(workdir / "tools.yaml"): {"bind": "/app/tools.yaml", "mode": "ro"},
+    }
 
-    # 2. save/extract hooks
-    extract_hooks(hooks_blob, plugins_dir)
+    # 1. generate tools.yaml
+    tools_yaml = make_yaml(get_toolset_by_server_id(server_id))
 
-    # 3. run container
+    server_url, host_port = get_server_url_and_port(server_id)
+
+    # 2. save YAML
+    with open(yaml_path, "w") as f:
+        f.write(tools_yaml)
+
+    # 3. save/extract hooks
+    if hooks_blob:
+        extract_hooks(hooks_blob, plugins_dir)
+
+    # 4. run container
     client = docker_from_env()
-    host_port = next_port()
+
     try:
         container = client.containers.run(
             DOCKER_IMAGE,
             detach=True,
             name=f"toolbox_{uuid.uuid4().hex[:8]}",
             ports={"8002/tcp": host_port},
-            volumes={
-                str(plugins_dir): {"bind": "/plugins", "mode": "ro"},
-                str(yaml_path):  {"bind": "/app/tools.yaml", "mode": "ro"},
-            },
-            # any env overrides here
+            volumes=volumes,
         )
 
-        dep = Deployment(
-        container_id=container.id,
-        host_port=host_port,
-        workdir=workdir,
-        volumes={
-            str(workdir / "plugins"): {"bind": "/plugins", "mode": "ro"},
-            str(workdir / "tools.yaml"): {"bind": "/app/tools.yaml", "mode": "ro"},
-        },
-    )
-        DEPLOYMENTS[container.id] = dep
+        #server_name = f"toolbox_{uuid.uuid4().hex[:8]}.speakmultiapp.com"
+        server_name = server_url.replace("https://", "")
+        try:
+            add_and_reload_nginx(host_port, server_name)
+        except Exception as e:
+            print(f"Error adding and reloading nginx: {e}")
+            raise HTTPException(500, f"Error adding and reloading nginx: {e}") from e
 
-        print("container_id: ", container.id)
+    #     dep = Deployment(
+    #     container_id=container.id,
+    #     host_port=host_port,
+    #     workdir=workdir,
+    #     server_name=server_name,
+    #     volumes=volumes,
+    # )
+
+        # container_id = container.id[:12]
+        # DEPLOYMENTS[container_id] = dep
+
+        # print("container_id: ", container_id)
 
     except docker.errors.ContainerError as e:
         shutil.rmtree(workdir)
         raise HTTPException(500, f"Docker run failed: {e.explanation}") from e
 
     return {
-        "container_id": container.id[:12],
-        "host_port": host_port,
-        "status_url": f"http://{os.getenv('PUBLIC_HOST', 'localhost')}:{host_port}/health",
+        "container_id": container.id,
+        "status_url": f"https://{server_name}/health",
+        "workdir": workdir,
+        "volumes": volumes,
+        "server_name": server_name,
+        "host_port": host_port
     }
 
+
 @app.post("/stop/{cid}")
-async def stop_container(cid: str):
-    dep = DEPLOYMENTS.get(cid)
-    if not dep:
-        raise HTTPException(404, f"Unknown container {cid}")
+async def stop_container(cid: str, conf: dict):
+    # dep = DEPLOYMENTS.get(cid)
+    # if not dep:
+    #     raise HTTPException(404, f"Unknown container {cid}")
 
     client = docker_from_env()
     try:
@@ -122,53 +141,21 @@ async def stop_container(cid: str):
     except docker.errors.NotFound:
         pass  # already gone
 
+    try:
+        remove_server_block(conf["server_name"])
+    except Exception as e:
+        print(f"Error removing server block: {e}")
+        raise HTTPException(500, f"Error removing server block: {e}") from e
+
     # cleanup filesystem assets
-    shutil.rmtree(dep.workdir, ignore_errors=True)
-    DEPLOYMENTS.pop(cid, None)
+    shutil.rmtree(conf["workdir"], ignore_errors=True)
+    # DEPLOYMENTS.pop(cid, None)
 
     return {"status": "stopped", "container_id": cid}
 
-
-@app.post("/restart/{cid}")
-async def restart_container(cid: str):
-    dep = DEPLOYMENTS.get(cid)
-    if not dep:
-        raise HTTPException(404, f"Unknown container {cid}")
-
-    client = docker_from_env()
-
-    # 1. ensure old container is gone (idempotent)
-    try:
-        old = client.containers.get(cid)
-        old.stop(timeout=10)
-        old.remove()
-    except docker.errors.NotFound:
-        pass
-
-    # 2. launch a **new** container on the SAME host_port and with SAME volumes
-    new_id = f"toolbox_{uuid.uuid4().hex[:8]}"
-    container = client.containers.run(
-        dep.image,
-        detach=True,
-        name=new_id,
-        ports={"8002/tcp": dep.host_port},
-        volumes=dep.volumes,
-    )
-
-    # 3. update registry
-    DEPLOYMENTS.pop(cid)
-    dep.container_id = container.id
-    DEPLOYMENTS[container.id] = dep
-
-    return {
-        "status": "restarted",
-        "old_container": cid,
-        "new_container": container.id[:12],
-        "host_port": dep.host_port,
-    }
 
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(app, host="127.0.0.1", port=8005)
