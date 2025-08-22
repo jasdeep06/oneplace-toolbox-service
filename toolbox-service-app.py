@@ -10,13 +10,13 @@ from dataclasses import dataclass
 from docker.models.containers import Container
 from utils import add_and_reload_nginx, remove_server_block
 
-from db import get_toolset_by_server_id, make_yaml, get_server_url_and_port
+from db import get_all_tools_for_yaml, make_yaml, get_server_url_and_port, get_container_id_by_server_id
 
-
+from fastapi.responses import PlainTextResponse, JSONResponse
 
 
 app = FastAPI()
-DOCKER_IMAGE = "0d7c52e29a52"        # your pre-built image
+DOCKER_IMAGE = "a5f0ab595509"        # your pre-built image
 
 
 
@@ -68,7 +68,8 @@ async def deploy(
     }
 
     # 1. generate tools.yaml
-    tools_yaml = make_yaml(get_toolset_by_server_id(server_id))
+    db_rows, api_rows = get_all_tools_for_yaml(server_id)
+    tools_yaml = make_yaml(db_rows, api_rows)
 
     server_url, host_port = get_server_url_and_port(server_id)
 
@@ -92,7 +93,6 @@ async def deploy(
             volumes=volumes,
         )
 
-        #server_name = f"toolbox_{uuid.uuid4().hex[:8]}.speakmultiapp.com"
         server_name = server_url.replace("https://", "")
         try:
             add_and_reload_nginx(host_port, server_name)
@@ -100,18 +100,7 @@ async def deploy(
             print(f"Error adding and reloading nginx: {e}")
             raise HTTPException(500, f"Error adding and reloading nginx: {e}") from e
 
-    #     dep = Deployment(
-    #     container_id=container.id,
-    #     host_port=host_port,
-    #     workdir=workdir,
-    #     server_name=server_name,
-    #     volumes=volumes,
-    # )
 
-        # container_id = container.id[:12]
-        # DEPLOYMENTS[container_id] = dep
-
-        # print("container_id: ", container_id)
 
     except docker.errors.ContainerError as e:
         shutil.rmtree(workdir)
@@ -154,6 +143,99 @@ async def stop_container(cid: str, conf: dict):
     return {"status": "stopped", "container_id": cid}
 
 
+@app.get(
+    "/logs/{server_id}",
+    response_class=PlainTextResponse,
+    summary="Fetch Docker logs for a deployed server",
+)
+async def get_logs(
+    server_id: str,
+    tail: int = 200,                   
+):
+    """
+    Return the last *tail* lines from the Docker container tied to **server_id**.
+
+    * Looks up *container_id* in DB (`get_container_id_by_server_id`).
+    * Calls `docker logs --tail <tail>`.
+    * Returns plain text (so `kubectl logs` style).
+    """
+    container_id = get_container_id_by_server_id(server_id)
+    if container_id is None:
+        raise HTTPException(404, f"No deployment found for server {server_id}")
+
+    client = docker_from_env()
+    try:
+        cont: Container = client.containers.get(container_id)
+    except docker.errors.NotFound:
+        raise HTTPException(404, f"Container {container_id} not running")
+
+    try:
+        logs_bytes = cont.logs(tail=tail)
+    except docker.errors.APIError as e:
+        raise HTTPException(500, f"Docker logs failed: {e.explanation}") from e
+
+    return logs_bytes.decode("utf-8", errors="replace")
+
+
+# ----------------------------------------------------------------------
+
+
+# ----------------------------------------------------------------------
+@app.get(
+    "/health/{server_id}",
+    response_class=JSONResponse,
+    summary="Check the health / runtime state of a deployed server",
+)
+async def container_health(server_id: str):
+    """
+    Return runtime status for the Docker container linked to *server_id*.
+
+    Response schema
+    ---------------
+    {
+      "server_id":     "<uuid>",
+      "container_id":  "<12-char id>",
+      "running":        true | false,
+      "state":          "running" | "exited" | "paused" | ...,
+      "health":         "healthy" | "unhealthy" | null   # requires HEALTHCHECK
+    }
+    """
+    container_id = get_container_id_by_server_id(server_id)
+    if container_id is None:
+        return {
+            "server_id":    server_id,
+            "container_id": container_id,
+            "running":      False,
+            "state":        "not_found",
+            "health":       None,
+        }
+
+    client = docker_from_env()
+    try:
+        cont: Container = client.containers.get(container_id)
+    except docker.errors.NotFound:
+        # Entry in DB but Docker doesn’t have it (crashed / pruned)
+        return {
+            "server_id":    server_id,
+            "container_id": container_id,
+            "running":      False,
+            "state":        "not_found",
+            "health":       None,
+        }
+
+    state = cont.attrs["State"]              # raw “docker inspect” state block
+    running     = state["Running"]
+    status_str  = state["Status"]            # running / exited / restarting / …
+    health_info = state.get("Health")
+    health_str  = health_info["Status"] if health_info else None  # healthy / unhealthy
+
+    return {
+        "server_id":    server_id,
+        "container_id": container_id[:12],
+        "running":      running,
+        "state":        status_str,
+        "health":       health_str,
+    }
 
 
 if __name__ == "__main__":

@@ -1,0 +1,95 @@
+sources:
+  my-pg-source:
+    kind: postgres
+    host: ep-ancient-shape-a1kjibq3-pooler.ap-southeast-1.aws.neon.tech
+    port: 5432        # Neon uses the standard port unless noted otherwise
+    database: neondb
+    user: neondb_owner
+    password: npg_OqZYgaH46CQb
+  cat-http:
+    kind: http
+    baseUrl: https://api.thecatapi.com/v1
+    timeout: 10s
+    headers:
+      x-api-key: live_oE29eYcFbYyPZ2k7TCaA6k5F0W1dcfedx1S4ADGBz0rUgCuGQZkc7zUFssfytC9l
+
+metadata_source:
+  host: ep-ancient-shape-a1kjibq3-pooler.ap-southeast-1.aws.neon.tech
+  port: 5432        # Neon uses the standard port unless noted otherwise
+  database: neondb
+  user: neondb_owner
+  password: npg_OqZYgaH46CQb
+
+tools:
+  users-in-workspace:
+    kind: postgres-sql
+    source: my-pg-source
+    description: Get all users in a workspace.
+    parameters:
+      - name: workspace_id
+        type: string
+        description: The id of the workspace.
+    statement: |
+      SELECT *
+      FROM public.user
+      JOIN public.user_workspace_link
+        ON public.user.id = public.user_workspace_link.user_id
+      WHERE workspace_id = $1;
+    # pre_hook: pre-test:func1
+    datasource_ids: "64e65350-30ae-4f50-a133-a52f049213cb,657c66ce-6589-419a-9bcf-cd099deeb6eb"
+
+  domains-in-workspace:
+    kind: postgres-sql
+    source: my-pg-source
+    description: Get all domains in a workspace.
+    parameters:
+      - name: workspace_id
+        type: string
+        description: The id of the workspace.
+    statement: |
+      SELECT name, description
+      FROM public.domain
+      WHERE workspace_id = $1;
+    datasource_ids: "9f98a1fd-7d1c-4b00-8ac4-91d8729ebc74"
+
+  workspace-favourited-by-user:
+    kind: postgres-sql
+    source: my-pg-source
+    description: Get all workspaces favourited by a user.
+    parameters:
+      - name: user_id
+        type: string
+        description: The id of the user.
+    statement: |
+      SELECT *
+      FROM public.workspace
+      JOIN public.user_workspace_favorited
+        ON public.workspace.id = public.user_workspace_favorited.workspace_id
+      WHERE user_id = $1;
+    datasource_ids: "7c07b8ac-0d14-4f44-8c34-43b9fc696bc0,7f8b474f-0fcd-48e8-b15d-54828cb58c01"
+
+  cat-image-tool:
+    kind: http
+    source: cat-http
+    description: "Get a random cat image"
+    path: /images/{{.search}}
+    method: GET
+    queryParams:
+      - name: limit
+        description: number of images to return
+        type: integer
+      - name: breed_ids
+        description: breed ids
+        type: string
+    pathParams:
+      - name: search
+        description: search term
+        type: string
+
+toolsets:
+  user-workspace-server:
+    - users-in-workspace
+    - workspace-favourited-by-user
+    - cat-image-tool
+  workspace-domain-server:
+    - domains-in-workspace

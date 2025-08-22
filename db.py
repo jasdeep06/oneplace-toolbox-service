@@ -29,12 +29,77 @@ LEFT JOIN      tool_datasource_link      AS tdl   ON tdl.tool_id      = t.id
 LEFT JOIN      datasource                AS d     ON d.id            = tdl.datasource_id
 LEFT JOIN		connection				  AS c     ON c.id			  = d.connection_id
 LEFT JOIN       db_type					  AS dbt   ON dbt.id         = c.db_type
-WHERE ms.id = %(server_id)s
+WHERE ms.id = %(server_id)s AND t.type = 'DATABASE_TOOL'
 ORDER BY ts.name, t.name, d.name;        
 """
 
+# Query API tools as JSON blobs, parameterized by server_id
+api_tools_query = """
+SELECT
+    json_build_object(
+        'id',           t.id::text,
+        'name',         t.name,
+        'description',  t.description,
+        'tool_type',    t.type,
+
+        /* ---------- HTTP-connection summary ------------- */
+        'connection_name', hc.name,
+        'connection_id',   hc.id::text,
+        'base_url',        hc.base_url,
+
+        /* ---------- API metadata ------------------------ */
+        'method',       atm.method,
+        'path',         atm.path,
+        'path_params',  atm.path_params,
+        'query_params', atm.query_params,
+        'body_params',  atm.body_params,
+        'body',         atm.body,
+        'inherit_auth', atm.inherit_auth,
+
+        /* resolved auth (inherit ⇒ take from connection) */
+        'auth_type',
+            CASE WHEN atm.inherit_auth THEN hc.auth_type ELSE atm.auth_type END,
+        'auth_config',
+            CASE WHEN atm.inherit_auth THEN hc.auth_config ELSE atm.auth_config END,
+
+        /* headers always come from the connection */
+        'headers',      hc.headers,
+
+        /* toolset membership for YAML grouping */
+        'toolset_name', ts.name
+    ) AS api_tool_detail
+FROM           mcp_server              AS ms
+JOIN           mcp_server_toolset_link AS mstl  ON mstl.mcp_server_id = ms.id
+JOIN           toolset                 AS ts    ON ts.id             = mstl.toolset_id
+JOIN           toolset_tool_link       AS ttl   ON ttl.toolset_id    = ts.id
+JOIN           tool                    AS t     ON t.id              = ttl.tool_id
+JOIN           api_tool_metadata       AS atm   ON atm.tool_id       = t.id
+JOIN           http_connection         AS hc    ON hc.id             = atm.http_connection_id
+WHERE ms.id = %(server_id)s
+  AND t.type = 'API_TOOL'
+ORDER BY ts.name, t.name;
+"""
+
+def get_api_tools_by_server_id(server_id: str) -> list[dict]:
+    with psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor) as conn:
+        with conn.cursor() as cur:
+            cur.execute(api_tools_query, {'server_id': server_id})
+            rows = cur.fetchall()
+            out = []
+            for r in rows:
+                j = r.get("api_tool_detail")
+                if isinstance(j, str):
+                    try:
+                        j = json.loads(j)
+                    except Exception:
+                        continue
+                if isinstance(j, dict):
+                    out.append(j)
+            return out
+
 from collections import OrderedDict, defaultdict
 import json, re, yaml
+import base64
 
 from yaml.representer import SafeRepresenter
 import yaml, collections
@@ -50,11 +115,84 @@ _slug_rx = re.compile(r"[^a-z0-9]+")
 def _slug(text: str) -> str:
     return _slug_rx.sub("-", text.lower()).strip("-")
 
-def make_yaml(rows: list[dict]) -> str:
+def _convert_sql_named_to_positional(sql: str, param_defs) -> str:
+    """Convert %(name)s style placeholders to $1, $2 ... based on param order.
+
+    - Uses the order of items in param_defs (list of dicts with 'name') to assign indices.
+    - Repeated names map to the same index.
+    - Unknown names (not present in param_defs) are assigned indices after known ones,
+      in order of first appearance.
+    - If the SQL already uses $-style placeholders, this function leaves them untouched.
+    """
+    if not sql:
+        return sql
+
+    try:
+        names_in_order = [p.get("name") for p in (param_defs or []) if isinstance(p, dict) and p.get("name")]
+    except Exception:
+        names_in_order = []
+
+    name_to_idx: dict[str, int] = {}
+    # Assign indices for known names by declared order first
+    for i, nm in enumerate(names_in_order, start=1):
+        if nm not in name_to_idx:
+            name_to_idx[nm] = i
+
+    next_idx = len(name_to_idx) + 1
+
+    # Regex for %(name)s / %(name)d / %(name)f etc
+    pattern = re.compile(r"%\((?P<name>[A-Za-z_][A-Za-z0-9_]*)\)[a-zA-Z]")
+
+    def repl(m: re.Match):
+        nm = m.group("name")
+        nonlocal next_idx
+        if nm not in name_to_idx:
+            name_to_idx[nm] = next_idx
+            next_idx += 1
+        return f"${name_to_idx[nm]}"
+
+    return pattern.sub(repl, sql)
+
+def make_yaml(rows: list[dict], api_tools: list[dict] | None = None) -> str:
+    if api_tools is None:
+        api_tools = []
+
+    # Compute auth headers helper (only supports header location)
+    def _auth_headers_for(auth_type: str | None, cfg: dict | None) -> dict:
+        if not auth_type or not cfg:
+            return {}
+        auth_type = (auth_type or "").upper()
+        loc = (cfg.get("location") or "").lower()
+        if loc != "header":
+            return {}
+
+        if auth_type == "API_KEY":
+            name = cfg.get("name")
+            val = cfg.get("value")
+            return {name: val} if name and val is not None else {}
+        if auth_type == "BEARER":
+            tok = cfg.get("access_token")
+            return {"Authorization": f"Bearer {tok}"} if tok else {}
+        if auth_type == "BASIC":
+            u, p = cfg.get("username"), cfg.get("password")
+            if u is not None and p is not None:
+                b64 = base64.b64encode(f"{u}:{p}".encode("utf-8")).decode("ascii")
+                return {"Authorization": f"Basic {b64}"}
+        return {}
+
+    # Aggregate connection-level auth headers when tools inherit auth
+    conn_auth_headers: dict[str, dict] = defaultdict(dict)
+    for t in api_tools:
+        if t.get("inherit_auth"):
+            ah = _auth_headers_for(t.get("auth_type"), t.get("auth_config") or {})
+            if ah:
+                conn_auth_headers[t["connection_id"]].update(ah)
+
     # ---------- 1. SOURCES ---------------------------------------------------
     src_by_conn: dict[str, str] = {}
     sources_od: OrderedDict[str, dict] = OrderedDict()
 
+    # 1a. Database connections
     for row in rows:
         conn_id = row["connection_id"]
         if conn_id in src_by_conn:
@@ -65,7 +203,8 @@ def make_yaml(rows: list[dict]) -> str:
         src_by_conn[conn_id] = key
 
         sources_od[key] = OrderedDict(
-            kind     = row["kind"],
+            #convert to lowercase
+            kind     = row["kind"].lower(),
             host     = cfg["host"],
             port     = int(cfg.get("port", 5432)),
             database = cfg["database"],
@@ -73,7 +212,34 @@ def make_yaml(rows: list[dict]) -> str:
             password = cfg["password"],
         )
 
-    # ---------- 1b. METADATA SOURCE (static) -------------------------------
+    # 1b. HTTP connections (API sources)
+    for t in api_tools:
+        conn_id = t["connection_id"]
+        if conn_id in src_by_conn:
+            continue
+
+        key = _slug(t.get("connection_name") or f"http-{len(src_by_conn)+1}")
+        # avoid name collisions with DB sources if any
+        while key in sources_od:
+            key = f"{key}-http"
+
+        src_by_conn[conn_id] = key
+
+        http_src = OrderedDict(
+            kind    = "http",
+            baseUrl = t["base_url"],
+        )
+        headers = (t.get("headers") or {}).copy()
+        # append any resolved connection-level auth headers
+        if conn_id in conn_auth_headers:
+            headers.update(conn_auth_headers[conn_id])
+        if headers:
+            http_src["headers"] = headers
+        # If timeout is later added to query: if t.get("timeout"): http_src["timeout"] = t["timeout"]
+
+        sources_od[key] = http_src
+
+    # ---------- 1c. METADATA SOURCE (static) -------------------------------
     metadata_source = OrderedDict(
         host     = "ep-ancient-shape-a1kjibq3-pooler.ap-southeast-1.aws.neon.tech",
         port     = 5432,
@@ -86,6 +252,7 @@ def make_yaml(rows: list[dict]) -> str:
     tools_od: OrderedDict[str, dict] = OrderedDict()
     ds_for_tool: defaultdict[str, set[str]] = defaultdict(set)
 
+    # 2a. DB tools
     for row in rows:
         tool_key = _slug(row["tool_name"])
         src_key  = src_by_conn[row["connection_id"]]
@@ -103,25 +270,71 @@ def make_yaml(rows: list[dict]) -> str:
         except Exception:
             params_json = []
 
+        converted_sql = _convert_sql_named_to_positional(row["sql_query"], params_json)
         tools_od[tool_key] = OrderedDict(
-            kind       = kind,
-            source     = src_key,
-            description= row["tool_description"],
-            parameters = params_json,
-            statement  = row["sql_query"].rstrip() + "\n",
+            kind        = kind.lower(),
+            source      = src_key,
+            description = row["tool_description"],
+            parameters  = params_json,
+            statement   = (converted_sql or "").rstrip() + "\n",
         )
 
-    # attach comma-separated datasource IDs
+    # 2b. API tools (HTTP)
+    for t in api_tools:
+        tool_key = _slug(t["name"])
+        if tool_key in tools_od:
+            continue
+
+        src_key = src_by_conn[t["connection_id"]]
+        # format path params: /x/{id} -> /x/{{.id}}
+        path_val = t.get("path") or ""
+        if t.get("path_params"):
+            path_val = re.sub(r"\{([A-Za-z0-9_]+)\}", r"{{.\1}}", path_val)
+
+        http_tool = OrderedDict(
+            kind        = "http",
+            source      = src_key,
+            description = t.get("description"),
+            path        = path_val,
+            method      = t["method"],
+        )
+        if t.get("path_params"):
+            http_tool["pathParams"] = t["path_params"]
+        if t.get("query_params"):
+            http_tool["queryParams"] = t["query_params"]
+        if t.get("body_params"):
+            http_tool["bodyParams"] = t["body_params"]
+        if t.get("body") is not None:
+            http_tool["body"] = t["body"]
+
+        # If auth is not inherited, attach per-tool auth headers
+        if not t.get("inherit_auth"):
+            th = _auth_headers_for(t.get("auth_type"), t.get("auth_config") or {})
+            if th:
+                http_tool["headers"] = th
+
+        tools_od[tool_key] = http_tool
+
+    # attach comma-separated datasource IDs for DB tools
     for tkey, ids in ds_for_tool.items():
         tools_od[tkey]["datasource_ids"] = ",".join(sorted(ids))
 
     # ---------- 3. TOOLSETS --------------------------------------------------
     toolsets_od: OrderedDict[str, list[str]] = OrderedDict()
+
+    # DB tool memberships
     for row in rows:
         ts_key   = _slug(row["toolset_name"])
         tool_key = _slug(row["tool_name"])
         toolsets_od.setdefault(ts_key, []).append(tool_key)
 
+    # API tool memberships
+    for t in api_tools:
+        ts_key   = _slug(t["toolset_name"])
+        tool_key = _slug(t["name"])
+        toolsets_od.setdefault(ts_key, []).append(tool_key)
+
+    # de-dup per toolset
     for ts_key, lst in toolsets_od.items():
         seen = set()
         toolsets_od[ts_key] = [x for x in lst if not (x in seen or seen.add(x))]
@@ -134,7 +347,7 @@ def make_yaml(rows: list[dict]) -> str:
         toolsets        = toolsets_od,
     )
 
-    # write SQL in literal block style
+    # write SQL in literal block style (only for DB tools)
     class _Lit(str): pass
     yaml.add_representer(
         _Lit,
@@ -142,10 +355,10 @@ def make_yaml(rows: list[dict]) -> str:
         Dumper=yaml.SafeDumper
     )
     for t in tools_od.values():
-        t["statement"] = _Lit(t["statement"])
+        if "statement" in t:
+            t["statement"] = _Lit(t["statement"])
 
     return yaml.safe_dump(doc, sort_keys=False, default_flow_style=False)
-
 # Usage:
 # rows = [dict(r) for r in session.exec(stmt).all()]
 # print(make_yaml(rows))
@@ -182,6 +395,37 @@ def get_server_url_and_port(server_id: str):
             return results["server_url"], results["port"]
 
 
+container_id_query = """
+SELECT
+    ms.image_details             AS image_details
+FROM           mcp_server                AS ms
+WHERE ms.id = %(server_id)s
+"""
+
+def get_container_id_by_server_id(server_id: str):
+    with psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor) as conn:
+        with conn.cursor() as cur:
+            cur.execute(container_id_query, {'server_id': server_id})
+            results = cur.fetchone()
+            image_details = results["image_details"]
+            if 'container_id' in image_details:
+                return image_details['container_id']
+            else:
+                return None
 
 
-# print(get_server_url_and_port('1dd10264-432d-411f-95f2-4b3cff101471'))
+def get_all_tools_for_yaml(server_id: str):
+    db_rows  = get_toolset_by_server_id(server_id)
+    api_rows = get_api_tools_by_server_id(server_id)
+    return db_rows, api_rows
+
+
+if __name__ == "__main__":
+    db_rows, api_rows = get_all_tools_for_yaml('7e9f56cd-7c04-4ed8-b148-496e3d7794ae')
+    print(make_yaml(db_rows, api_rows))
+
+# Example:
+# db_rows, api_rows = get_all_tools_for_yaml('your-server-id')
+# print(make_yaml(db_rows, api_rows))
+
+# print(get_container_id_by_server_id('1dd10264-432d-411f-95f2-4b3cff101471'))
