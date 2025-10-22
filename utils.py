@@ -5,9 +5,10 @@ from typing import List
 
 from pathlib import Path
 
-CERT_PATH = "/etc/ssl/cloudflare/origin.pem"
-KEY_PATH  = "/etc/ssl/cloudflare/origin.key"
+CERT_PATH = " /etc/letsencrypt/live/speakmultiapp.com/fullchain.pem"
+KEY_PATH = "/etc/letsencrypt/live/speakmultiapp.com/privkey.pem"
 CONF_FILE = Path("/etc/nginx/sites-available/speakmultiapp")
+
 
 def add_and_reload_nginx(port: int, server_name: str) -> None:
     """
@@ -84,8 +85,6 @@ server {{
     print(f"✓ Added {server_name} → localhost:{port} and reloaded nginx.")
 
 
-
-
 def _split_server_blocks(text: str) -> List[str]:
     """
     Very small brace-counter that splits an nginx config into top-level
@@ -95,9 +94,9 @@ def _split_server_blocks(text: str) -> List[str]:
     blocks, buf, depth = [], [], 0
     for line in text.splitlines(keepends=True):
         # Track braces
-        opens   = line.count("{")
-        closes  = line.count("}")
-        depth  += opens - closes
+        opens = line.count("{")
+        closes = line.count("}")
+        depth += opens - closes
 
         buf.append(line)
 
@@ -129,9 +128,11 @@ def remove_server_block(server_name: str) -> None:
 
     # ---- 2 ▸ filter out the blocks we want to delete -------------------------
     pattern = re.compile(r"\bserver_name\s+.*\b" + re.escape(server_name) + r"\b")
-    kept_parts = [blk for blk in parts
-                  if not (blk.lstrip().startswith("server")
-                          and pattern.search(blk))]
+    kept_parts = [
+        blk
+        for blk in parts
+        if not (blk.lstrip().startswith("server") and pattern.search(blk))
+    ]
     if len(kept_parts) == len(parts):
         print(f"No server block mentioning '{server_name}' found – nothing changed.")
         return
@@ -143,13 +144,14 @@ def remove_server_block(server_name: str) -> None:
     print("→ running `nginx -t` …")
     test = subprocess.run(["nginx", "-t"], capture_output=True, text=True)
     if test.returncode != 0:
-        CONF_FILE.write_text(original)               # rollback
+        CONF_FILE.write_text(original)  # rollback
         raise RuntimeError(f"nginx -t failed:\n{test.stderr}")
 
     # ---- 4 ▸ reload nginx ----------------------------------------------------
     print("→ reloading nginx …")
-    reload = subprocess.run(["systemctl", "reload", "nginx"],
-                            capture_output=True, text=True)
+    reload = subprocess.run(
+        ["systemctl", "reload", "nginx"], capture_output=True, text=True
+    )
     if reload.returncode != 0:
         raise RuntimeError(f"Failed to reload nginx:\n{reload.stderr}")
 
