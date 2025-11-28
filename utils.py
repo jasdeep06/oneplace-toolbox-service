@@ -5,9 +5,9 @@ from typing import List
 
 from pathlib import Path
 
-CERT_PATH = " /etc/letsencrypt/live/speakmultiapp.com/fullchain.pem"
-KEY_PATH = "/etc/letsencrypt/live/speakmultiapp.com/privkey.pem"
-CONF_FILE = Path("/etc/nginx/sites-available/speakmultiapp")
+CERT_PATH = " /etc/letsencrypt/live/speakmulti.com/fullchain.pem"
+KEY_PATH = "/etc/letsencrypt/live/speakmulti.com/privkey.pem"
+CONF_FILE = Path("/etc/nginx/sites-available/speakmulti")
 
 
 def add_and_reload_nginx(port: int, server_name: str) -> None:

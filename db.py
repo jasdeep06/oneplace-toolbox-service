@@ -3,7 +3,7 @@ from socket import timeout
 from psycopg2.extras import RealDictCursor
 
 
-BASE_URL = "https://oneplace-api.speakmultiapp.com/"
+BASE_URL = "https://oneplace-api.speakmulti.com/"
 TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMmM4Nzg5OC03MGMwLTQzMjAtOTZiZi1hMjI0ZWY5ZjI3NjMifQ.3HxEAI26XSq1S-tJCS1pOXsvjexGuAARqCy_vj5LiAo"
 
 query = """
