@@ -16,7 +16,7 @@ from fastapi.responses import PlainTextResponse, JSONResponse
 
 
 app = FastAPI()
-DOCKER_IMAGE = "603c20ebc6bf"        # your pre-built image
+DOCKER_IMAGE = "d372f8c225db"        # your pre-built image
 
 
 
@@ -68,8 +68,8 @@ async def deploy(
     }
 
     # 1. generate tools.yaml
-    db_rows, api_rows, rag_rows, nlq_rows = get_all_tools_for_yaml(server_id)
-    tools_yaml = make_yaml(db_rows, api_rows, rag_rows, nlq_rows)
+    db_rows, api_rows, rag_rows, nlq_rows, event_rows = get_all_tools_for_yaml(server_id)
+    tools_yaml = make_yaml(db_rows, api_rows, rag_rows, nlq_rows, event_rows)
     print(tools_yaml)
 
     server_url, host_port = get_server_url_and_port(server_id)

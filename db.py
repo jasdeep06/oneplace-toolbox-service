@@ -138,6 +138,33 @@ ORDER BY ts.name, t.name;
 
 """
 
+event_tool_query = """
+SELECT
+    json_build_object(
+        'id',                   t.id::text,
+        'name',                 t.name,
+        'description',          t.description,
+        'tool_type',            t.type,
+        'event_connection_id',  ec.id,
+        'event_connection_name', ec.name,
+        'event_store_name',     ec.event_store_name,
+        'workspace_id',         ec.workspace_id,
+        'topic',                etm.parameters->0->>'topic',
+        'action',               etm.parameters->0->>'action',
+        'toolset_name',         ts.name
+    ) AS event_tool_detail
+FROM           mcp_server              AS ms
+JOIN           mcp_server_toolset_link AS mstl  ON mstl.mcp_server_id = ms.id
+JOIN           toolset                 AS ts    ON ts.id             = mstl.toolset_id
+JOIN           toolset_tool_link       AS ttl   ON ttl.toolset_id    = ts.id
+JOIN           tool                    AS t     ON t.id              = ttl.tool_id
+JOIN           event_tool_metadata     AS etm   ON etm.tool_id       = t.id
+JOIN           event_connection        AS ec    ON ec.id             = etm.event_connection_id
+WHERE ms.id = %(server_id)s
+  AND t.type = 'EVENT_TOOL'
+ORDER BY ts.name, t.name;
+"""
+
 
 def get_api_tools_by_server_id(server_id: str) -> list[dict]:
     with psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor) as conn:
@@ -185,6 +212,24 @@ def get_nlq_tools_by_server_id(server_id: str) -> list[dict]:
             for r in rows:
                 # note: the SELECT aliases it as rag_tool_detail
                 j = r.get("rag_tool_detail")
+                if isinstance(j, str):
+                    try:
+                        j = json.loads(j)
+                    except Exception:
+                        continue
+                if isinstance(j, dict):
+                    out.append(j)
+            return out
+
+
+def get_event_tools_by_server_id(server_id: str) -> list[dict]:
+    with psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor) as conn:
+        with conn.cursor() as cur:
+            cur.execute(event_tool_query, {"server_id": server_id})
+            rows = cur.fetchall()
+            out = []
+            for r in rows:
+                j = r.get("event_tool_detail")
                 if isinstance(j, str):
                     try:
                         j = json.loads(j)
@@ -277,6 +322,7 @@ def make_yaml(
     api_tools: list[dict] | None = None,
     rag_tools: list[dict] | None = None,
     nlq_tools: list[dict] | None = None,
+    event_tools: list[dict] | None = None,
 ) -> str:
     if api_tools is None:
         api_tools = []
@@ -284,6 +330,8 @@ def make_yaml(
         rag_tools = []
     if nlq_tools is None:
         nlq_tools = []
+    if event_tools is None:
+        event_tools = []
 
     # Compute auth headers helper (only supports header location)
     def _auth_headers_for(auth_type: str | None, cfg: dict | None) -> dict:
@@ -367,7 +415,7 @@ def make_yaml(
         sources_od[key] = http_src
 
     rag_src_key = None
-    if rag_tools or nlq_tools:
+    if rag_tools or nlq_tools or event_tools:
         rag_src_key = "rag-api"
         while rag_src_key in sources_od:
             rag_src_key = f"{rag_src_key}-http"
@@ -523,6 +571,43 @@ def make_yaml(
             )
             tools_od[tool_key] = http_tool
 
+    if event_tools:
+        for t in event_tools:
+            tool_key = _slug(t["name"])
+            if tool_key in tools_od:
+                continue
+
+            path_val = f"/workspace/{t['workspace_id']}/tool/{t['id']}/execute"
+
+            http_tool = OrderedDict(
+                kind="http",
+                source=rag_src_key,
+                description=t.get("description"),
+                path=path_val,
+                method="POST",
+                bodyParams=[
+                    {
+                        "name": "topic",
+                        "type": "string",
+                        "description": "Event topic name",
+                        "required": True,
+                    },
+                    {
+                        "name": "action",
+                        "type": "string",
+                        "description": "Action to perform (e.g., write)",
+                        "required": True,
+                    },
+                    {
+                        "name": "payload",
+                        "type": "object",
+                        "description": "Event payload/message data",
+                        "required": True,
+                    },
+                ],
+            )
+            tools_od[tool_key] = http_tool
+
     # attach comma-separated datasource IDs for DB tools
     for tkey, ids in ds_for_tool.items():
         tools_od[tkey]["datasource_ids"] = ",".join(sorted(ids))
@@ -548,6 +633,11 @@ def make_yaml(
         toolsets_od.setdefault(ts_key, []).append(tool_key)
 
     for t in nlq_tools:
+        ts_key = _slug(t["toolset_name"])
+        tool_key = _slug(t["name"])
+        toolsets_od.setdefault(ts_key, []).append(tool_key)
+
+    for t in event_tools:
         ts_key = _slug(t["toolset_name"])
         tool_key = _slug(t["name"])
         toolsets_od.setdefault(ts_key, []).append(tool_key)
@@ -635,8 +725,10 @@ def get_all_tools_for_yaml(server_id: str):
     api_rows = get_api_tools_by_server_id(server_id)
     rag_rows = get_rag_tools_by_server_id(server_id)
     nlq_rows = get_nlq_tools_by_server_id(server_id)
+    event_rows = get_event_tools_by_server_id(server_id)
     print("rag rows ", rag_rows)
-    return db_rows, api_rows, rag_rows, nlq_rows
+    print("event rows ", event_rows)
+    return db_rows, api_rows, rag_rows, nlq_rows, event_rows
 
 
 # if __name__ == "__main__":
@@ -644,10 +736,10 @@ def get_all_tools_for_yaml(server_id: str):
 #     print(make_yaml(db_rows, api_rows))
 
 # # # Example:
-db_rows, api_rows, rag_rows, nlq_rows = get_all_tools_for_yaml(
-    "d064901c-5afc-480f-a37f-313ae2e5676f"
+db_rows, api_rows, rag_rows, nlq_rows, event_rows = get_all_tools_for_yaml(
+    "551a04b9-15ab-4728-b918-b9a933e1db58"
 )
-print(make_yaml(db_rows, api_rows, rag_rows, nlq_rows))
+print(make_yaml(db_rows, api_rows, rag_rows, nlq_rows, event_rows))
 
 # print(get_container_id_by_server_id('1dd10264-432d-411f-95f2-4b3cff101471'))
 
