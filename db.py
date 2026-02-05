@@ -579,32 +579,40 @@ def make_yaml(
 
             path_val = f"/workspace/{t['workspace_id']}/tool/{t['id']}/execute"
 
+            # Define bodyParams based on action type
+            action = t.get("action", "write").lower()
+            if action == "write":
+                body_params = [
+                    {
+                        "name": "data",
+                        "type": "object",
+                        "description": "Event data to write (e.g., {\"event_type\": \"order_created\", \"order_id\": 123})",
+                        "required": True,
+                    },
+                ]
+            else:  # read action
+                body_params = [
+                    {
+                        "name": "num_messages",
+                        "type": "integer",
+                        "description": "Number of messages to read",
+                        "required": False,
+                    },
+                    {
+                        "name": "timeout",
+                        "type": "number",
+                        "description": "Timeout duration in seconds",
+                        "required": False,
+                    },
+                ]
+
             http_tool = OrderedDict(
                 kind="http",
                 source=rag_src_key,
                 description=t.get("description"),
                 path=path_val,
                 method="POST",
-                bodyParams=[
-                    {
-                        "name": "topic",
-                        "type": "string",
-                        "description": "Event topic name",
-                        "required": True,
-                    },
-                    {
-                        "name": "action",
-                        "type": "string",
-                        "description": "Action to perform (e.g., write)",
-                        "required": True,
-                    },
-                    {
-                        "name": "payload",
-                        "type": "object",
-                        "description": "Event payload/message data",
-                        "required": True,
-                    },
-                ],
+                bodyParams=body_params,
             )
             tools_od[tool_key] = http_tool
 
