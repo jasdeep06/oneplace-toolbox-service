@@ -1,9 +1,10 @@
 from __future__ import annotations
+import os
 from socket import timeout
 from psycopg2.extras import RealDictCursor
 
 
-BASE_URL = "https://oneplace-api.speakmulti.com/"
+BASE_URL = os.getenv("ONEPLACE_BASE_URL", "https://api.getoneplace.ai")
 TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMmM4Nzg5OC03MGMwLTQzMjAtOTZiZi1hMjI0ZWY5ZjI3NjMifQ.3HxEAI26XSq1S-tJCS1pOXsvjexGuAARqCy_vj5LiAo"
 
 query = """
@@ -154,7 +155,6 @@ def get_api_tools_by_server_id(server_id: str) -> list[dict]:
                         continue
                 if isinstance(j, dict):
                     out.append(j)
-            print(out)
             return out
 
 
@@ -227,6 +227,37 @@ _slug_rx = re.compile(r"[^a-z0-9]+")
 
 def _slug(text: str) -> str:
     return _slug_rx.sub("-", text.lower()).strip("-")
+
+
+def _bool_from_config(value) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "t", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "f", "no", "n", "off", "disable", "disabled"}:
+            return False
+    return None
+
+
+def _db_ssl_enabled(cfg: dict) -> bool:
+    explicit = _bool_from_config(cfg.get("ssl"))
+    if explicit is not None:
+        return explicit
+
+    ssl_mode = cfg.get("sslmode") or cfg.get("ssl_mode")
+    if isinstance(ssl_mode, str):
+        mode = ssl_mode.strip().lower()
+        if mode in {"disable", "disabled"}:
+            return False
+        if mode:
+            return True
+
+    host = str(cfg.get("host", "")).strip().lower()
+    return host.endswith(".neon.tech")
 
 
 def _convert_sql_named_to_positional(sql: str, param_defs) -> str:
@@ -311,10 +342,8 @@ def make_yaml(
     # Aggregate connection-level auth headers when tools inherit auth
     conn_auth_headers: dict[str, dict] = defaultdict(dict)
     for t in api_tools:
-        print("t ", t)
         if t.get("inherit_auth"):
             ah = _auth_headers_for(t.get("auth_type"), t.get("auth_config") or {})
-            print("ah ", ah)
             if ah:
                 conn_auth_headers[t["connection_id"]].update(ah)
 
@@ -340,6 +369,7 @@ def make_yaml(
             database=cfg["database"],
             user=cfg["username"],
             password=cfg["password"],
+            ssl=_db_ssl_enabled(cfg),
         )
 
     # 1b. HTTP connections (API sources)
@@ -457,7 +487,6 @@ def make_yaml(
                 http_tool["headers"] = th
 
         tools_od[tool_key] = http_tool
-        print("rag tools ", rag_tools)
 
     if rag_tools:
         for t in rag_tools:
@@ -631,11 +660,9 @@ def get_container_id_by_server_id(server_id: str):
 
 def get_all_tools_for_yaml(server_id: str):
     db_rows = get_toolset_by_server_id(server_id)
-    print("db rows ", db_rows)
     api_rows = get_api_tools_by_server_id(server_id)
     rag_rows = get_rag_tools_by_server_id(server_id)
     nlq_rows = get_nlq_tools_by_server_id(server_id)
-    print("rag rows ", rag_rows)
     return db_rows, api_rows, rag_rows, nlq_rows
 
 
@@ -643,11 +670,11 @@ def get_all_tools_for_yaml(server_id: str):
 #     db_rows, api_rows = get_all_tools_for_yaml('7e9f56cd-7c04-4ed8-b148-496e3d7794ae')
 #     print(make_yaml(db_rows, api_rows))
 
-# # # Example:
-db_rows, api_rows, rag_rows, nlq_rows = get_all_tools_for_yaml(
-    "d064901c-5afc-480f-a37f-313ae2e5676f"
-)
-print(make_yaml(db_rows, api_rows, rag_rows, nlq_rows))
+if __name__ == "__main__":
+    db_rows, api_rows, rag_rows, nlq_rows = get_all_tools_for_yaml(
+        "d064901c-5afc-480f-a37f-313ae2e5676f"
+    )
+    print(make_yaml(db_rows, api_rows, rag_rows, nlq_rows))
 
 # print(get_container_id_by_server_id('1dd10264-432d-411f-95f2-4b3cff101471'))
 

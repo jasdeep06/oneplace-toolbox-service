@@ -3,11 +3,25 @@ import subprocess
 from pathlib import Path
 from typing import List
 
-from pathlib import Path
 
-CERT_PATH = " /etc/letsencrypt/live/speakmulti.com/fullchain.pem"
-KEY_PATH = "/etc/letsencrypt/live/speakmulti.com/privkey.pem"
-CONF_FILE = Path("/etc/nginx/sites-available/speakmulti")
+DOMAIN_BASE = "getoneplace.ai"
+CERT_PATH = "/etc/letsencrypt/live/getoneplace.ai-0001/fullchain.pem"
+KEY_PATH = "/etc/letsencrypt/live/getoneplace.ai-0001/privkey.pem"
+CONF_FILE = Path("/etc/nginx/sites-available/getoneplace-mcp")
+ENABLED_FILE = Path("/etc/nginx/sites-enabled/getoneplace-mcp")
+
+
+def normalize_server_name(server_name: str) -> str:
+    """Map legacy MCP hostnames onto the getoneplace.ai domain."""
+    host = server_name.strip().lower()
+    host = re.sub(r"^https?://", "", host).split("/", 1)[0]
+
+    legacy_suffixes = (".speakmulti.com", ".speakmultiapp.com")
+    for suffix in legacy_suffixes:
+        if host.endswith(suffix):
+            return host[: -len(suffix)] + f".{DOMAIN_BASE}"
+
+    return host
 
 
 def add_and_reload_nginx(port: int, server_name: str) -> None:
@@ -23,10 +37,29 @@ def add_and_reload_nginx(port: int, server_name: str) -> None:
         If the function is not run with sufficient privileges.
     """
 
+    server_name = normalize_server_name(server_name)
+
+    CONF_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if not CONF_FILE.exists():
+        CONF_FILE.write_text("# Dynamic OnePlace MCP server blocks\n")
+    if not ENABLED_FILE.exists():
+        ENABLED_FILE.symlink_to(CONF_FILE)
+
+    remove_server_block(server_name, reload_nginx=False)
+
     # 1 ▸ Build the block
     block = f"""
 server {{
+    listen 80;
+    listen [::]:80;
+    server_name {server_name};
+
+    return 301 https://$host$request_uri;
+}}
+
+server {{
     listen 443 ssl;
+    listen [::]:443 ssl;
     server_name {server_name};
 
     ssl_certificate     {CERT_PATH};
@@ -35,7 +68,7 @@ server {{
     ssl_ciphers         HIGH:!aNULL:!MD5;
 
     location / {{
-        proxy_pass http://localhost:{port};
+        proxy_pass http://127.0.0.1:{port};
         proxy_set_header Host               $host;
         proxy_set_header X-Real-IP          $remote_addr;
         proxy_set_header X-Forwarded-For    $proxy_add_x_forwarded_for;
@@ -111,7 +144,7 @@ def _split_server_blocks(text: str) -> List[str]:
     return blocks
 
 
-def remove_server_block(server_name: str) -> None:
+def remove_server_block(server_name: str, reload_nginx: bool = True) -> None:
     """
     Remove every server-block that has `server_name <server_name>` (substring
     match), validate config, and reload nginx.
@@ -121,6 +154,10 @@ def remove_server_block(server_name: str) -> None:
     RuntimeError   if nginx syntax test or reload fails
     FileNotFoundError / PermissionError on IO problems
     """
+    server_name = normalize_server_name(server_name)
+    if not CONF_FILE.exists():
+        return
+
     original = CONF_FILE.read_text()
 
     # ---- 1 ▸ split file into chunks -----------------------------------------
@@ -139,6 +176,9 @@ def remove_server_block(server_name: str) -> None:
 
     new_conf = "".join(kept_parts)
     CONF_FILE.write_text(new_conf)
+
+    if not reload_nginx:
+        return
 
     # ---- 3 ▸ syntax check ----------------------------------------------------
     print("→ running `nginx -t` …")

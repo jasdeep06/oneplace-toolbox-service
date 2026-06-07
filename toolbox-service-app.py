@@ -8,7 +8,7 @@ import docker.errors
 
 from dataclasses import dataclass
 from docker.models.containers import Container
-from utils import add_and_reload_nginx, remove_server_block
+from utils import add_and_reload_nginx, normalize_server_name, remove_server_block
 
 from db import get_all_tools_for_yaml, make_yaml, get_server_url_and_port, get_container_id_by_server_id
 
@@ -16,12 +16,37 @@ from fastapi.responses import PlainTextResponse, JSONResponse
 
 
 app = FastAPI()
-DOCKER_IMAGE = "603c20ebc6bf"        # your pre-built image
+DOCKER_IMAGE = "oneplace-mcp-toolbox:latest"
 
+
+def _container_publishes_port(container: Container, host_port: int) -> bool:
+    ports = container.attrs.get("NetworkSettings", {}).get("Ports", {}) or {}
+    for bindings in ports.values():
+        for binding in bindings or []:
+            if str(binding.get("HostPort")) == str(host_port):
+                return True
+    return False
+
+
+def _remove_toolbox_containers_on_port(client, host_port: int) -> None:
+    """Remove stale toolbox containers that still own the DB-assigned port."""
+    for container in client.containers.list(all=True):
+        name = (container.name or "").lower()
+        if not name.startswith("toolbox_"):
+            continue
+        if not _container_publishes_port(container, host_port):
+            continue
+        print(
+            f"Removing stale toolbox container {container.name} "
+            f"({container.short_id}) on host port {host_port}"
+        )
+        try:
+            container.remove(force=True)
+        except docker.errors.NotFound:
+            pass
 
 
 # ----------------------------------------------------------------------
-
 
 
 
@@ -70,7 +95,6 @@ async def deploy(
     # 1. generate tools.yaml
     db_rows, api_rows, rag_rows, nlq_rows = get_all_tools_for_yaml(server_id)
     tools_yaml = make_yaml(db_rows, api_rows, rag_rows, nlq_rows)
-    print(tools_yaml)
 
     server_url, host_port = get_server_url_and_port(server_id)
 
@@ -86,6 +110,8 @@ async def deploy(
     client = docker_from_env()
 
     try:
+        _remove_toolbox_containers_on_port(client, host_port)
+
         container = client.containers.run(
             DOCKER_IMAGE,
             detach=True,
@@ -94,18 +120,20 @@ async def deploy(
             volumes=volumes,
         )
 
-        server_name = server_url.replace("https://", "")
+        server_name = normalize_server_name(server_url)
         try:
             add_and_reload_nginx(host_port, server_name)
         except Exception as e:
+            container.remove(force=True)
             print(f"Error adding and reloading nginx: {e}")
             raise HTTPException(500, f"Error adding and reloading nginx: {e}") from e
 
 
 
-    except docker.errors.ContainerError as e:
+    except (docker.errors.ContainerError, docker.errors.APIError) as e:
         shutil.rmtree(workdir)
-        raise HTTPException(500, f"Docker run failed: {e.explanation}") from e
+        detail = getattr(e, "explanation", str(e))
+        raise HTTPException(500, f"Docker run failed: {detail}") from e
 
     return {
         "container_id": container.id,
