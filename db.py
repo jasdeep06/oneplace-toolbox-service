@@ -610,7 +610,10 @@ def make_yaml(
 import psycopg2
 import os
 
-DATABASE_URL = "postgresql://postgres:postgres@localhost:5433/oneplace_core"
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql://postgres:postgres@localhost:5433/oneplace_core",
+)
 
 
 def get_toolset_by_server_id(server_id: str):
